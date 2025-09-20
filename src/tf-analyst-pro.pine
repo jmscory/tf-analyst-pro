@@ -1,0 +1,347 @@
+//@version=6
+
+// Strategy: TF-Analyst Pro — Position-Aware Smart Trading Assistant
+// Author: James Cory 
+// Purpose:
+// - Position-aware recommendations (own vs looking to buy)
+// - Smart entry price recommendations based on your situation
+// - Combined technical & fundamental analysis with position context
+// - Personalized alerts and guidance (alpha)
+
+strategy("TF-Analyst Pro — Position-Aware Trading Assistant", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// ---------------------------
+// === USER POSITION & PREFERENCES ===
+// --- Position Management
+currentPosition = input.string("Looking to Buy", "Current Position", options=["Looking to Buy", "Already Own - Small Position", "Already Own - Full Position", "Looking to Add More"], tooltip="Select your current position status")
+riskTolerance = input.string("Moderate", "Risk Tolerance", options=["Conservative", "Moderate", "Aggressive"], tooltip="Your risk tolerance level")
+investmentHorizon = input.string("Medium-term (3-12 months)", "Investment Horizon", options=["Short-term (1-3 months)", "Medium-term (3-12 months)", "Long-term (1+ years)"])
+
+// --- Technical indicator params
+maShortLen = input.int(50, "Short MA length (SMA50)", minval=1)
+maLongLen = input.int(200, "Long MA length (SMA200)", minval=1)
+macd_fast = input.int(12, "MACD fast", minval=1)
+macd_slow = input.int(26, "MACD slow", minval=1)
+macd_sig = input.int(9, "MACD signal", minval=1)
+adxLen = input.int(14, "RSI length (trend strength)", minval=1)
+adxThresh = input.int(25, "Trend strength threshold", minval=1)
+bbLen = input.int(20, "BB length", minval=1)
+bbMult = input.float(2.0, "BB multiplier", step=0.1)
+volLen = input.int(20, "Volume SMA length", minval=1)
+
+// --- Price Target Settings (position-aware)
+supportLookback = input.int(20, "Support/Resistance Lookback", minval=5, maxval=50)
+conservativeDiscount = input.float(3.0, "Conservative Entry Discount %", minval=1.0, maxval=8.0, step=0.5)
+moderateDiscount = input.float(2.0, "Moderate Entry Discount %", minval=0.5, maxval=5.0, step=0.5)
+aggressiveDiscount = input.float(1.0, "Aggressive Entry Discount %", minval=0.0, maxval=3.0, step=0.5)
+profitTargetPct = input.float(8.0, "Profit Target %", minval=2.0, maxval=20.0, step=0.5)
+stopLossPct = input.float(5.0, "Stop Loss %", minval=1.0, maxval=15.0, step=0.5)
+
+// --- Weighting and thresholds (position-aware)
+techWeight = input.float(0.5, "Technical Weight", step=0.1)
+fundWeight = input.float(0.5, "Fundamental Weight", step=0.1)
+buyThresh = input.int(75, "BUY threshold (final score >=)", minval=60, maxval=95)
+sellThresh = input.int(30, "SELL threshold (final score <=)", minval=5, maxval=40)
+
+// --- Alert Settings
+enableAlerts = input.bool(true, "Enable Smart Alerts")
+showPriceTargets = input.bool(true, "Show Price Targets on Chart")
+showPositionInfo = input.bool(true, "Show Position-Specific Info")
+
+// --- Fundamental fallback inputs
+fallback_eps_growth = input.float(10.0, "Manual EPS YoY growth % (fallback)", step=0.1)
+fallback_rev_growth = input.float(8.0, "Manual Revenue YoY growth % (fallback)", step=0.1)
+fallback_pe_rel = input.float(1.0, "Manual P/E vs sector median (ratio) (fallback)", step=0.01)
+fallback_de = input.float(0.5, "Manual Debt/Equity (fallback)", step=0.01)
+fallback_roe = input.float(12.0, "Manual ROE % (fallback)", step=0.1)
+
+// --- Presets (sector/timeframe tuning)
+preset = input.string("Default", "Scoring preset", options=["Default","Technology","Financials","Value","Growth"], tooltip="Preset mapping bias")
+
+// ---------------------------
+// === POSITION-AWARE LOGIC ===
+// Determine position status and strategy
+isLookingToBuy = currentPosition == "Looking to Buy"
+hasSmallPosition = currentPosition == "Already Own - Small Position"
+hasFullPosition = currentPosition == "Already Own - Full Position"
+lookingToAdd = currentPosition == "Looking to Add More"
+
+// Risk-based discount calculation
+entryDiscountPct = if riskTolerance == "Conservative"
+    conservativeDiscount
+else if riskTolerance == "Moderate"
+    moderateDiscount
+else
+    aggressiveDiscount
+
+// Investment horizon adjustment
+horizonMultiplier = if investmentHorizon == "Short-term (1-3 months)"
+    0.8
+else if investmentHorizon == "Medium-term (3-12 months)"
+    1.0
+else
+    1.2
+
+// ---------------------------
+// === TECHNICAL CALCULATIONS ===
+smaShort = ta.sma(close, maShortLen)
+smaLong = ta.sma(close, maLongLen)
+
+trendScore = if smaShort > smaLong and close > smaShort
+    1.0
+else if smaShort > smaLong and close <= smaShort
+    0.75
+else if math.abs(smaShort - smaLong) / math.max(math.abs(smaLong), 1e-6) < 0.01
+    0.5
+else
+    0.0
+
+[macdLine, macdSignal, macdHist] = ta.macd(close, macd_fast, macd_slow, macd_sig)
+macdPrev = nz(macdHist[1], 0)
+momentumScore = macdHist > 0 ? (macdHist > macdPrev ? 1.0 : 0.85) : 0.0
+
+// Calculate trend strength using RSI as proxy for ADX (simpler approach)
+rsiVal = ta.rsi(close, adxLen)
+// Strong trend when RSI is away from 50 (either > 65 or < 35)
+trendStrengthVal = math.abs(rsiVal - 50)
+trendStrengthScore = trendStrengthVal >= adxThresh ? 1.0 : (trendStrengthVal >= (adxThresh - 5) ? 0.6 : 0.0)
+
+volSMA = ta.sma(volume, volLen)
+volScore = volume > volSMA ? 1.0 : (volume > volSMA * 0.8 ? 0.6 : 0.0)
+
+basis = ta.sma(close, bbLen)
+dev = ta.stdev(close, bbLen)
+upper = basis + bbMult * dev
+lower = basis - bbMult * dev
+bbWidth = (upper - lower) / math.max(basis, 1e-6)
+bbWidthAvg = ta.sma(bbWidth, 50)
+volatilityScore = bbWidth > bbWidthAvg ? 1.0 : (bbWidth > bbWidthAvg * 0.7 ? 0.6 : 0.3)
+
+// Calculate technical score
+techScore = (trendScore + momentumScore + trendStrengthScore + volScore + volatilityScore) / 5.0
+techScorePct = techScore * 100.0
+
+// ---------------------------
+// === POSITION-AWARE PRICE TARGET CALCULATIONS ===
+// Find recent support and resistance levels
+recentHigh = ta.highest(high, supportLookback)
+recentLow = ta.lowest(low, supportLookback)
+
+// Calculate support level
+supportLevel = math.min(lower, recentLow) // Use BB lower band or recent low as support
+
+// Position-aware entry price calculation
+baseEntryPrice = close * (1 - entryDiscountPct/100)
+supportBasedEntry = supportLevel
+
+// Position-specific entry recommendations
+recommendedBuyPrice = if isLookingToBuy
+    // New buyers: wait for better entry
+    math.min(baseEntryPrice, supportBasedEntry)
+else if hasSmallPosition or lookingToAdd
+    // Adding to position: less aggressive discount
+    close * (1 - entryDiscountPct/2/100)
+else
+    // Full position: only on significant dips
+    close * (1 - entryDiscountPct*1.5/100)
+
+// Calculate target prices with position awareness
+profitTarget = close * (1 + profitTargetPct * horizonMultiplier/100)
+stopLossPrice = close * (1 - stopLossPct/100)
+
+// Risk/Reward ratio
+riskRewardRatio = (profitTarget - close) / (close - stopLossPrice)
+
+// ---------------------------
+// === FUNDAMENTAL SCORING ===
+eps_growth_pct = fallback_eps_growth
+rev_growth_pct = fallback_rev_growth
+pe_rel = fallback_pe_rel
+de_ratio = fallback_de
+roe_pct = fallback_roe
+
+preset_tech_bias = preset == "Technology" ? 1 : 0
+preset_value_bias = preset == "Value" ? 1 : 0
+preset_growth_bias = preset == "Growth" ? 1 : 0
+
+f_mapFundScore(eps_g, rev_g, pe_rel_in, de_in, roe_in, presetTech, presetValue, presetGrowth) =>
+    epsS = eps_g >= 30 ? 1.0 : eps_g >= 15 ? 0.9 : eps_g >= 5 ? 0.7 : eps_g >= 0 ? 0.5 : 0.2
+    epsS := epsS + (presetTech > 0 ? 0.05 : 0) + (presetGrowth > 0 ? 0.05 : 0)
+    epsS := math.min(epsS, 1.0)
+
+    revS = rev_g >= 20 ? 1.0 : rev_g >= 10 ? 0.85 : rev_g >= 0 ? 0.7 : 0.4
+    revS := revS + (presetTech > 0 ? 0.05 : 0)
+    revS := math.min(revS, 1.0)
+
+    peS = pe_rel_in <= 1.0 ? 1.0 : pe_rel_in <= 1.5 ? 0.8 : pe_rel_in <= 2.0 ? 0.6 : 0.4
+    peS := peS + (presetValue > 0 ? 0.1 : 0)
+    peS := math.min(peS, 1.0)
+
+    deS = de_in <= 0.5 ? 1.0 : de_in <= 1.0 ? 0.75 : 0.5
+    deS := deS + (presetValue > 0 ? 0.1 : 0)
+    deS := math.min(deS, 1.0)
+
+    roeS = roe_in >= 15 ? 1.0 : roe_in >= 10 ? 0.8 : roe_in >= 5 ? 0.6 : 0.3
+    roeS := roeS + (presetTech > 0 ? 0.05 : 0) + (presetGrowth > 0 ? 0.05 : 0)
+    roeS := math.min(roeS, 1.0)
+
+    fundSum = epsS + revS + peS + deS + roeS
+    fundScoreFinal = fundSum / 5.0
+    fundScoreFinal
+
+fundScore = f_mapFundScore(eps_growth_pct, rev_growth_pct, pe_rel, de_ratio, roe_pct, preset_tech_bias, preset_value_bias, preset_growth_bias)
+fundScorePct = fundScore * 100.0
+
+// ---------------------------
+// === POSITION-AWARE FINAL SCORING ===
+finalScore = techScorePct * techWeight + fundScorePct * fundWeight
+finalScore := math.min(math.max(finalScore, 0), 100)
+
+// Position-aware threshold adjustments
+adjustedBuyThresh = if hasFullPosition
+    buyThresh + 10  // Higher bar for full positions
+else if hasSmallPosition
+    buyThresh - 5   // Slightly easier for small positions
+else
+    buyThresh       // Standard for new buyers
+
+adjustedSellThresh = if isLookingToBuy
+    sellThresh - 5  // More sensitive sell signals when not holding
+else
+    sellThresh
+
+// ---------------------------
+// === POSITION-AWARE SIGNALS ===
+buySignal = finalScore >= adjustedBuyThresh and riskRewardRatio >= 1.5
+strongBuySignal = finalScore >= (adjustedBuyThresh + 10) and riskRewardRatio >= 2.0
+sellSignal = finalScore <= adjustedSellThresh
+strongSellSignal = finalScore <= (adjustedSellThresh - 10)
+holdSignal = not buySignal and not sellSignal
+
+// Position-specific recommendations
+positionAction = if isLookingToBuy and buySignal
+    strongBuySignal ? "STRONG BUY - Great Entry!" : "BUY - Good Entry Point"
+else if (hasSmallPosition or lookingToAdd) and buySignal
+    "ADD TO POSITION"
+else if hasFullPosition and strongBuySignal
+    "CONSIDER ADDING (if possible)"
+else if sellSignal and not isLookingToBuy
+    strongSellSignal ? "SELL - Take Profits" : "CONSIDER SELLING"
+else if holdSignal
+    "HOLD - Wait for Better Setup"
+else
+    "NO ACTION"
+
+// Signal strength for better UI
+signalStrength = if buySignal
+    strongBuySignal ? "STRONG BUY" : "BUY"
+else if sellSignal
+    strongSellSignal ? "STRONG SELL" : "SELL"
+else
+    "HOLD"
+
+// ---------------------------
+// === CLEAN UI VISUALIZATION ===
+// Plot final score with gradient colors
+scoreColor = if finalScore >= adjustedBuyThresh
+    strongBuySignal ? color.new(color.green, 0) : color.new(color.green, 30)
+else if finalScore <= adjustedSellThresh
+    strongSellSignal ? color.new(color.red, 0) : color.new(color.red, 30)
+else
+    color.new(color.orange, 20)
+
+plot(finalScore, title="TF-Analyst Score", color=scoreColor, linewidth=2)
+hline(adjustedBuyThresh, "BUY Threshold", color=color.new(color.green, 50), linestyle=hline.style_dashed)
+hline(adjustedSellThresh, "SELL Threshold", color=color.new(color.red, 50), linestyle=hline.style_dashed)
+
+// Background coloring for clear signals
+bgColor = if strongBuySignal
+    color.new(color.green, 95)
+else if buySignal
+    color.new(color.green, 97)
+else if strongSellSignal
+    color.new(color.red, 95)
+else if sellSignal
+    color.new(color.red, 97)
+else
+    na
+bgcolor(bgColor, title="Signal Background")
+
+// ---------------------------
+// === POSITION-AWARE PRICE TARGET LINES ===
+var line profitLine = na
+var line stopLine = na
+var line buyLine = na
+
+if showPriceTargets and barstate.islast
+    // Clean up old lines
+    line.delete(profitLine)
+    line.delete(stopLine)
+    line.delete(buyLine)
+    
+    if buySignal or showPositionInfo
+        // Draw price target lines
+        profitLine := line.new(bar_index-10, profitTarget, bar_index+10, profitTarget, color=color.new(color.green, 20), style=line.style_dashed, width=2)
+        stopLine := line.new(bar_index-10, stopLossPrice, bar_index+10, stopLossPrice, color=color.new(color.red, 20), style=line.style_dashed, width=2)
+        buyLine := line.new(bar_index-10, recommendedBuyPrice, bar_index+10, recommendedBuyPrice, color=color.new(color.blue, 20), style=line.style_solid, width=2)
+
+// ---------------------------
+// === ENHANCED POSITION-AWARE LABELS ===
+var label mainLabel = na
+var label priceLabel = na
+var label positionLabel = na
+
+if barstate.islast
+    label.delete(mainLabel)
+    label.delete(priceLabel)
+    label.delete(positionLabel)
+    
+    // Main signal label
+    labelColor = if strongBuySignal
+        color.new(color.green, 0)
+    else if buySignal
+        color.new(color.green, 20)
+    else if strongSellSignal
+        color.new(color.red, 0)
+    else if sellSignal
+        color.new(color.red, 20)
+    else
+        color.new(color.orange, 20)
+    
+    mainLabel := label.new(bar_index, high + (high-low)*0.1, signalStrength + "\nScore: " + str.tostring(finalScore, "#.#"), style=label.style_label_down, color=labelColor, textcolor=color.white, size=size.normal)
+    
+    // Position-specific info label
+    if showPositionInfo
+        positionInfo = "📊 POSITION: " + currentPosition + "\n🎯 ACTION: " + positionAction + "\n💡 " + riskTolerance + " Risk | " + investmentHorizon
+        
+        positionLabel := label.new(bar_index, high + (high-low)*0.25, positionInfo, style=label.style_label_down, color=color.new(color.blue, 20), textcolor=color.white, size=size.small)
+    
+    // Price targets label (enhanced with position context)
+    if (buySignal or showPositionInfo) and showPriceTargets
+        priceInfo = "🎯 PRICE TARGETS:\nEntry: $" + str.tostring(recommendedBuyPrice, "#.##") + "\nTarget: $" + str.tostring(profitTarget, "#.##") + "\nStop: $" + str.tostring(stopLossPrice, "#.##") + "\nR/R: " + str.tostring(riskRewardRatio, "#.#")
+        
+        priceLabel := label.new(bar_index, low - (high-low)*0.2, priceInfo, style=label.style_label_up, color=color.new(color.blue, 10), textcolor=color.white, size=size.small)
+
+// ---------------------------
+// === POSITION-AWARE ALERT CONDITIONS ===
+// Using TradingView's built-in placeholders for dynamic values
+alertcondition(strongBuySignal and enableAlerts and isLookingToBuy, title="🔥 STRONG BUY - New Position", 
+     message="🔥 STRONG BUY OPPORTUNITY!\nSymbol: {{ticker}}\nPrice: ${{close}}\nPosition: NEW ENTRY\n⭐ HIGH CONFIDENCE SIGNAL ⭐")
+
+alertcondition(buySignal and enableAlerts and (hasSmallPosition or lookingToAdd), title="📈 ADD TO POSITION", 
+     message="📈 ADD TO POSITION!\nSymbol: {{ticker}}\nPrice: ${{close}}\nAction: INCREASE HOLDINGS\n🎯 Good addition opportunity")
+
+alertcondition(buySignal and not strongBuySignal and enableAlerts and isLookingToBuy, title="🚀 BUY - New Entry", 
+     message="🚀 TF-ANALYST BUY SIGNAL!\nSymbol: {{ticker}}\nPrice: ${{close}}\nPosition: NEW ENTRY\n📈 Strong technical and fundamental score!")
+
+alertcondition(sellSignal and enableAlerts and not isLookingToBuy, title="📉 SzELL Alert", 
+     message="📉 TF-ANALYST SELL SIGNAL!\nSymbol: {{ticker}}\nPrice: ${{close}}\nAction: CONSIDER SELLING\n⚠️ Take profits or reduce position")
+
+// ---------------------------
+// === STRATEGY ORDERS (Optional) ===
+// Uncomment to enable automated trading
+// if buySignal and strategy.position_size <= 0
+//     strategy.entry("Long", strategy.long, stop=recommendedBuyPrice)
+//     strategy.exit("Exit", "Long", limit=profitTarget, stop=stopLossPrice)
+// else if sellSignal and strategy.position_size > 0
+//     strategy.close("Long")
