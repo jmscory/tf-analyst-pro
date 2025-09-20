@@ -2,6 +2,14 @@
 
 // Strategy: TF-Analyst Pro — Position-Aware Smart Trading Assistant
 // Author: James Cory 
+// -------------------------------------------------
+// Disclaimer: This script is for educational and informational purposes only. 
+// It does not constitute financial, investment, or trading advice. 
+// Trading and investing carry significant risk, and you may lose money. 
+// You are solely responsible for your own decisions and outcomes. 
+// Always conduct independent research and consider consulting a licensed 
+// financial advisor before making any investment decisions.
+// -------------------------------------------------
 // Purpose:
 // - Position-aware recommendations (own vs looking to buy)
 // - Smart entry price recommendations based on your situation
